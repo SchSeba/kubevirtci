@@ -2,6 +2,11 @@
 
 set -ex
 
+function get_minor_version() {
+    [[ $1 =~ \.([0-9]+) ]]
+    echo ${BASH_REMATCH[1]}
+}
+
 setenforce 0
 sed -i "s/^SELINUX=.*/SELINUX=permissive/" /etc/selinux/config
 
@@ -32,7 +37,9 @@ repo_gpgcheck=1
 gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg
        https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
 EOF
-yum install -y docker
+
+yum install -y docker epel-release
+
 
 # Log to json files instead of journald
 sed -i 's/--log-driver=journald //g' /etc/sysconfig/docker
@@ -50,24 +57,32 @@ yum install --nogpgcheck -y \
     kubelet-${version} \
     kubectl-${version} \
     kubernetes-cni-0.6.0 \
-    openvswitch
+    http://cbs.centos.org/kojifiles/packages/openvswitch/2.10.1/3.el7/x86_64/openvswitch-2.10.1-3.el7.x86_64.rpm
 
 systemctl start openvswitch
 systemctl enable openvswitch
 
 ovs-vsctl add-br br1
 
-# Latest docker on CentOS uses systemd for cgroup management
-# kubeadm 1.11 uses a new config method for the kubelet
-if [[ $version =~ \.([0-9]+) ]] && [[ ${BASH_REMATCH[1]} -ge "11" ]]; then
+if [[ $(get_minor_version $version) -ge "15" ]]; then
     # TODO use config file! this is deprecated
     cat <<EOT >/etc/sysconfig/kubelet
-KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --runtime-cgroups=/systemd/system.slice --kubelet-cgroups=/systemd/system.slice --feature-gates=BlockVolume=true
+KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --runtime-cgroups=/systemd/system.slice --kubelet-cgroups=/systemd/system.slice --feature-gates="BlockVolume=true,CSIBlockVolume=true,VolumeSnapshotDataSource=true"
+EOT
+elif [[ $(get_minor_version $version) -ge "12" ]]; then
+    # TODO use config file! this is deprecated
+    cat <<EOT >/etc/sysconfig/kubelet
+KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --runtime-cgroups=/systemd/system.slice --kubelet-cgroups=/systemd/system.slice --allow-privileged=true --feature-gates="BlockVolume=true,CSIBlockVolume=true,VolumeSnapshotDataSource=true"
+EOT
+elif [[ $(get_minor_version $version) -ge "11" ]]; then
+    # TODO use config file! this is deprecated
+    cat <<EOT >/etc/sysconfig/kubelet
+KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --runtime-cgroups=/systemd/system.slice --kubelet-cgroups=/systemd/system.slice --allow-privileged=true --feature-gates="BlockVolume=true,CSIBlockVolume=true"
 EOT
 else
     cat <<EOT >>/etc/systemd/system/kubelet.service.d/09-kubeadm.conf
 [Service]
-Environment="KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --runtime-cgroups=/systemd/system.slice --kubelet-cgroups=/systemd/system.slice --feature-gates=BlockVolume=true"
+Environment="KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --runtime-cgroups=/systemd/system.slice --kubelet-cgroups=/systemd/system.slice --allow-privileged=true --feature-gates=BlockVolume=true"
 EOT
 fi
 
@@ -79,18 +94,22 @@ systemctl enable kubelet && systemctl start kubelet
 # Needed for kubernetes service routing and dns
 # https://github.com/kubernetes/kubernetes/issues/33798#issuecomment-250962627
 modprobe bridge
+modprobe br_netfilter
 cat <<EOF >  /etc/sysctl.d/k8s.conf
 net.bridge.bridge-nf-call-ip6tables = 1
 net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
 EOF
 sysctl --system
 
-kubeadm init --pod-network-cidr=10.244.0.0/16 --kubernetes-version v${version} --token abcdef.1234567890123456
+echo bridge >> /etc/modules
+echo br_netfilter >> /etc/modules
 
+kubeadm init --pod-network-cidr=10.244.0.0/16 --kubernetes-version v${version} --token abcdef.1234567890123456
 if [[ ${BASH_REMATCH[1]} -ge "12" ]]; then
-kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f /tmp/flannel-ge-12.yaml
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f /tmp/flannel-ge-12.yaml
 else
-kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f /tmp/flannel.yaml
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f /tmp/flannel.yaml
 fi
 
 # we need this command to allow the cluster-network-addons-operator to start and deploy all the requested components
@@ -103,13 +122,12 @@ kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f /tmp/cna/network-addon
 
 # Wait until flannel cluster-network-addons-operator and core dns pods are running.
 # Wait until all the network components are ready.
-kubectl --kubeconfig=/etc/kubernetes/admin.conf wait networkaddonsconfig cluster --for condition=Ready --timeout=800s
+# Wait for a long time on the first time only, we use the ifNotPresent image pull policy
+kubectl --kubeconfig=/etc/kubernetes/admin.conf wait networkaddonsconfig cluster --for condition=Available --timeout=1200s
 
-kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f /tmp/kubernetes-ovs-cni.yaml
-
-# Wait at least for one pod
-while [ -z "$(kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system | grep kube)" ]; do
-    echo "Waiting for at least one pod ..."
+# Wait at least for 7 pods
+while [[ "$(kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system --no-headers | wc -l)" -lt 7 ]]; do
+    echo "Waiting for at least 7 pods to appear ..."
     kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system
     sleep 10
 done
@@ -133,7 +151,7 @@ kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system
 reset_command="kubeadm reset"
 admission_flag="admission-control"
 # k8s 1.11 needs some changes
-if [[ $version =~ \.([0-9]+) ]] && [[ ${BASH_REMATCH[1]} -ge "11" ]]; then
+if [[ $(get_minor_version $version) -ge "11" ]]; then
     # k8s 1.11 asks for confirmation on kubeadm reset, which can be suppressed by a new force flag
     reset_command="kubeadm reset --force"
 
@@ -144,29 +162,17 @@ fi
 
 $reset_command
 
-# TODO new format since 1.11, this old format will be removed with 1.12, see https://kubernetes.io/docs/reference/setup-tools/kubeadm/kubeadm-init/#config-file
-cat > /etc/kubernetes/kubeadm.conf <<EOF
-apiVersion: kubeadm.k8s.io/v1alpha1
-kind: MasterConfiguration
-apiServerExtraArgs:
-  runtime-config: admissionregistration.k8s.io/v1alpha1
-  ${admission_flag}: Initializers,NamespaceLifecycle,LimitRanger,ServiceAccount,DefaultStorageClass,DefaultTolerationSeconds,NodeRestriction,MutatingAdmissionWebhook,ValidatingAdmissionWebhook,ResourceQuota
-  feature-gates: "BlockVolume=true"
-controllerManagerExtraArgs:
-  feature-gates: "BlockVolume=true"
-token: abcdef.1234567890123456
-kubernetesVersion: ${version}
-networking:
-  podSubnet: 10.244.0.0/16
-EOF
-
-# New configuration for kubernetes >= 1.12
-if [[ ${BASH_REMATCH[1]} -ge "12" ]]; then
-
 # audit log configuration
 mkdir /etc/kubernetes/audit
-cat > /etc/kubernetes/audit/adv-audit.yaml <<EOF
-apiVersion: audit.k8s.io/v1
+
+if [[ $(get_minor_version $version) -ge "12" ]]; then
+    audit_api_version="audit.k8s.io/v1"
+else
+    audit_api_version="audit.k8s.io/v1beta1"
+fi
+if [[ $(get_minor_version $version) -ge "11" ]]; then
+    cat > /etc/kubernetes/audit/adv-audit.yaml <<EOF
+apiVersion: ${audit_api_version}
 kind: Policy
 rules:
 - level: Request
@@ -184,8 +190,61 @@ rules:
   - ResponseStarted
   - Panic
 EOF
+fi
 
-cat > /etc/kubernetes/kubeadm.conf <<EOF
+if [[ $(get_minor_version $version) -ge "14" ]]; then
+    cat > /etc/kubernetes/kubeadm.conf <<EOF
+apiVersion: kubeadm.k8s.io/v1beta1
+bootstrapTokens:
+- groups:
+  - system:bootstrappers:kubeadm:default-node-token
+  token: abcdef.1234567890123456
+  ttl: 24h0m0s
+  usages:
+  - signing
+  - authentication
+kind: InitConfiguration
+---
+apiServer:
+  extraArgs:
+    allow-privileged: "true"
+    audit-log-format: json
+    audit-log-path: /var/log/k8s-audit/k8s-audit.log
+    audit-policy-file: /etc/kubernetes/audit/adv-audit.yaml
+    enable-admission-plugins: NamespaceLifecycle,LimitRanger,ServiceAccount,DefaultStorageClass,DefaultTolerationSeconds,NodeRestriction,MutatingAdmissionWebhook,ValidatingAdmissionWebhook,ResourceQuota
+    feature-gates: BlockVolume=true,CSIBlockVolume=true,VolumeSnapshotDataSource=true,AdvancedAuditing=true
+  extraVolumes:
+  - hostPath: /etc/kubernetes/audit
+    mountPath: /etc/kubernetes/audit
+    name: audit-conf
+    readOnly: true
+  - hostPath: /var/log/k8s-audit
+    mountPath: /var/log/k8s-audit
+    name: audit-log
+  timeoutForControlPlane: 4m0s
+apiVersion: kubeadm.k8s.io/v1beta1
+certificatesDir: /etc/kubernetes/pki
+clusterName: kubernetes
+controlPlaneEndpoint: ""
+controllerManager:
+  extraArgs:
+    feature-gates: BlockVolume=true,CSIBlockVolume=true,VolumeSnapshotDataSource=true
+dns:
+  type: CoreDNS
+etcd:
+  local:
+    dataDir: /var/lib/etcd
+imageRepository: k8s.gcr.io
+kind: ClusterConfiguration
+kubernetesVersion: ${version}
+networking:
+  dnsDomain: cluster.local
+  podSubnet: 10.244.0.0/16
+  serviceSubnet: 10.96.0.0/12
+EOF
+
+elif [[ $(get_minor_version $version) -ge "12" ]]; then
+    cat > /etc/kubernetes/kubeadm.conf <<EOF
 apiVersion: kubeadm.k8s.io/v1alpha3
 bootstrapTokens:
 - groups:
@@ -199,7 +258,8 @@ kind: InitConfiguration
 ---
 apiServerExtraArgs:
   enable-admission-plugins: Initializers,NamespaceLifecycle,LimitRanger,ServiceAccount,DefaultStorageClass,DefaultTolerationSeconds,NodeRestriction,MutatingAdmissionWebhook,ValidatingAdmissionWebhook,ResourceQuota
-  feature-gates: "BlockVolume=true,AdvancedAuditing=true"
+  feature-gates: "BlockVolume=true,CSIBlockVolume=true,VolumeSnapshotDataSource=true,AdvancedAuditing=true"
+  allow-privileged: "true"
   runtime-config: admissionregistration.k8s.io/v1alpha1
   audit-policy-file: "/etc/kubernetes/audit/adv-audit.yaml"
   audit-log-path: "/var/log/k8s-audit/k8s-audit.log"
@@ -214,12 +274,57 @@ apiServerExtraVolumes:
   writable: true
 apiVersion: kubeadm.k8s.io/v1alpha3
 controllerManagerExtraArgs:
-  feature-gates: BlockVolume=true
+  feature-gates: "BlockVolume=true,CSIBlockVolume=true,VolumeSnapshotDataSource=true"
 kind: ClusterConfiguration
 kubernetesVersion: ${version}
 networking:
   podSubnet: 10.244.0.0/16
 
+EOF
+
+elif [[ $(get_minor_version $version) -ge "11" ]]; then
+    cat > /etc/kubernetes/kubeadm.conf <<EOF
+apiVersion: kubeadm.k8s.io/v1alpha1
+kind: MasterConfiguration
+apiServerExtraArgs:
+  runtime-config: admissionregistration.k8s.io/v1alpha1
+  ${admission_flag}: Initializers,NamespaceLifecycle,LimitRanger,ServiceAccount,DefaultStorageClass,DefaultTolerationSeconds,NodeRestriction,MutatingAdmissionWebhook,ValidatingAdmissionWebhook,ResourceQuota
+  feature-gates: "BlockVolume=true,CustomResourceSubresources=true,CSIBlockVolume=true,AdvancedAuditing=true"
+  allow-privileged: "true"
+  audit-policy-file: "/etc/kubernetes/audit/adv-audit.yaml"
+  audit-log-path: "/var/log/k8s-audit/k8s-audit.log"
+  audit-log-format: "json"
+apiServerExtraVolumes:
+- name: audit-conf
+  hostPath: "/etc/kubernetes/audit"
+  mountPath: "/etc/kubernetes/audit"
+- name: audit-log
+  hostPath: "/var/log/k8s-audit"
+  mountPath: "/var/log/k8s-audit"
+  writable: true
+controllerManagerExtraArgs:
+  feature-gates: "BlockVolume=true,CSIBlockVolume=true"
+token: abcdef.1234567890123456
+kubernetesVersion: ${version}
+networking:
+  podSubnet: 10.244.0.0/16
+EOF
+
+else
+    cat > /etc/kubernetes/kubeadm.conf <<EOF
+apiVersion: kubeadm.k8s.io/v1alpha1
+kind: MasterConfiguration
+apiServerExtraArgs:
+  runtime-config: admissionregistration.k8s.io/v1alpha1
+  ${admission_flag}: Initializers,NamespaceLifecycle,LimitRanger,ServiceAccount,DefaultStorageClass,DefaultTolerationSeconds,NodeRestriction,MutatingAdmissionWebhook,ValidatingAdmissionWebhook,ResourceQuota
+  feature-gates: "BlockVolume=true,CustomResourceSubresources=true"
+  allow-privileged: "true"
+controllerManagerExtraArgs:
+  feature-gates: "BlockVolume=true"
+token: abcdef.1234567890123456
+kubernetesVersion: ${version}
+networking:
+  podSubnet: 10.244.0.0/16
 EOF
 fi
 
@@ -238,3 +343,10 @@ chcon -R unconfined_u:object_r:svirt_sandbox_file_t:s0 /mnt/local-storage/
 # Pre pull fluentd image used in logging
 docker pull fluent/fluentd:v1.2-debian
 docker pull fluent/fluentd-kubernetes-daemonset:v1.2-debian-syslog
+
+# Pre pull images used in Ceph CSI
+docker pull quay.io/k8scsi/csi-attacher:v1.0.1
+docker pull quay.io/k8scsi/csi-provisioner:v1.0.1
+docker pull quay.io/k8scsi/csi-snapshotter:v1.0.1
+docker pull quay.io/cephcsi/rbdplugin:v1.0.0
+docker pull quay.io/k8scsi/csi-node-driver-registrar:v1.0.2

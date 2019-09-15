@@ -9,8 +9,8 @@ do
 done
 
 kubeadm init --config /etc/kubernetes/kubeadm.conf
-version=`kubectl version --short --client | cut -d":" -f2 |sed  's/ //g' | cut -c2- | cut -d"." -f2`
 
+version=`kubectl version --short --client | cut -d":" -f2 |sed  's/ //g' | cut -c2- | cut -d"." -f2`
 if [[ ${version} -ge "12" ]]; then
 kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f /tmp/flannel-ge-12.yaml
 else
@@ -26,9 +26,7 @@ kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f /tmp/cna/network-addon
 
 # Wait until flannel cluster-network-addons-operator and core dns pods are running.
 # Wait until all the network components are ready.
-kubectl --kubeconfig=/etc/kubernetes/admin.conf wait networkaddonsconfig cluster --for condition=Ready --timeout=800s
-
-kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f /tmp/kubernetes-ovs-cni.yaml
+kubectl --kubeconfig=/etc/kubernetes/admin.conf wait networkaddonsconfig cluster --for condition=Available --timeout=800s
 
 # Wait for api server to be up.
 kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes --no-headers
